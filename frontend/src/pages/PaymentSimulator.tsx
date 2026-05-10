@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { createPayment, updatePaymentStatus } from '../api/api';
-import { Send, AlertCircle, CheckCircle2, RefreshCcw, CreditCard, Play } from 'lucide-react';
+import { Send, AlertCircle, CheckCircle2, RefreshCcw, CreditCard } from 'lucide-react';
 
 type ApiError = {
   code?: string;

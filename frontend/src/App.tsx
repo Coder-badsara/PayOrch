@@ -5,6 +5,7 @@ import Dashboard from './pages/Dashboard';
 import PaymentSimulator from './pages/PaymentSimulator';
 import WebhookLogs from './pages/WebhookLogs';
 import GatewayHealth from './pages/GatewayHealth';
+import Settings from './pages/Settings';
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean, error: Error | null }> {
   constructor(props: { children: ReactNode }) {
@@ -52,7 +53,7 @@ const App: React.FC = () => {
             <Route path="/simulator" element={<PaymentSimulator />} />
             <Route path="/webhooks" element={<WebhookLogs />} />
             <Route path="/health" element={<GatewayHealth />} />
-            <Route path="/settings" element={<div className="text-center py-20 text-gray-500 italic">Settings page coming soon...</div>} />
+            <Route path="/settings" element={<Settings />} />
           </Routes>
         </Layout>
       </Router>

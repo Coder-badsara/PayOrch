@@ -14,6 +14,9 @@ export interface GatewayHealth {
   status: 'HEALTHY' | 'DEGRADED' | 'UNHEALTHY' | 'CIRCUIT_OPEN';
   success_rate: number;
   avg_latency_ms: number;
+  p95_latency_ms?: number;
+  total_count: number;
+  error_count: number;
   last_checked_at: string;
 }
 

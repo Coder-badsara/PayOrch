@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { getTransactions } from '../api/api';
 import type { Transaction } from '../types';
 import { format } from 'date-fns';
-import { RefreshCcw, Search, Filter, Calendar } from 'lucide-react';
+import { RefreshCcw, Filter } from 'lucide-react';
 import CustomDatePicker from '../components/CustomDatePicker';
 
 const Dashboard: React.FC = () => {
@@ -84,7 +84,7 @@ const Dashboard: React.FC = () => {
           <p className="text-gray-400">Manage and monitor all payment transactions.</p>
         </div>
         <button 
-          onClick={fetchTransactions}
+          onClick={() => fetchTransactions()}
           disabled={loading}
           className="flex items-center space-x-2 bg-indigo-600 hover:bg-indigo-700 active:scale-90 disabled:opacity-70 disabled:active:scale-100 px-4 py-2 rounded-lg transition-all duration-200 shadow-lg shadow-indigo-500/20"
         >

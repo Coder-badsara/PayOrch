@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { getWebhookLogs } from '../api/api';
 import { format } from 'date-fns';
-import { RefreshCcw, Webhook, CheckCircle, XCircle, AlertTriangle, Calendar, Filter } from 'lucide-react';
+import { RefreshCcw, Webhook, CheckCircle, XCircle, AlertTriangle, Filter } from 'lucide-react';
 import CustomDatePicker from '../components/CustomDatePicker';
 
 const WebhookLogs: React.FC = () => {
@@ -74,7 +74,7 @@ const WebhookLogs: React.FC = () => {
           <p className="text-gray-400">Track and debug incoming webhook notifications.</p>
         </div>
         <button 
-          onClick={fetchLogs}
+          onClick={() => fetchLogs()}
           disabled={loading}
           className="flex items-center space-x-2 bg-indigo-600 hover:bg-indigo-700 active:scale-90 disabled:opacity-70 disabled:active:scale-100 px-4 py-2 rounded-lg transition-all duration-200 shadow-lg shadow-indigo-500/20"
         >
