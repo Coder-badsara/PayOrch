@@ -2,12 +2,14 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
-from .models import Payment, PaymentAttempt, StateTransition
+from .models import Payment, PaymentAttempt, StateTransition, TransactionStatus, GatewayName
 from .serializers import PaymentSerializer, CreatePaymentRequestSerializer, PaymentAttemptSerializer, StateTransitionSerializer
 from apps.orchestrator.service import OrchestratorService
+from apps.orchestrator.health_service import HealthService
 from apps.core.exceptions import AllGatewaysFailedError, InvalidStateTransitionError
 
 service = OrchestratorService()
+health_service = HealthService()
 
 
 from rest_framework.pagination import PageNumberPagination
@@ -89,6 +91,13 @@ class PaymentViewSet(viewsets.ViewSet):
             # Update status directly for simulation purposes
             payment.status = new_status
             payment.save()
+            
+            # Record health if it's a terminal status and we have a gateway
+            if payment.gateway_name and new_status in [TransactionStatus.CAPTURED, TransactionStatus.FAILED]:
+                health_service.record_event(
+                    gateway_name=GatewayName(payment.gateway_name),
+                    success=(new_status == TransactionStatus.CAPTURED)
+                )
             
             # Record transition using valid choices
             StateTransition.objects.create(

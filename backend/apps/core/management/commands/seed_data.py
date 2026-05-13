@@ -19,9 +19,10 @@ class Command(BaseCommand):
                 'priority': 100,
                 'conditions': {'currency': ['INR', 'USD']},
                 'gateway_weights': {
-                    'RAZORPAY': {'weight': 0.6, 'priority': 1},
-                    'STRIPE': {'weight': 0.3, 'priority': 2},
-                    'UPI': {'weight': 0.1, 'priority': 3}
+                    'RAZORPAY': {'weight': 0.5, 'priority': 1},
+                    'STRIPE': {'weight': 0.2, 'priority': 2},
+                    'PAYU': {'weight': 0.2, 'priority': 3},
+                    'UPI': {'weight': 0.1, 'priority': 4}
                 },
                 'is_active': True
             }

@@ -6,10 +6,12 @@ from apps.payments.state_machine import PaymentStateMachine
 from apps.gateways.registry import gateway_registry
 from .models import WebhookEvent, WebhookEventStatus
 from apps.core.exceptions import WebhookSignatureError
+from apps.orchestrator.health_service import HealthService
 from celery import shared_task
 import logging
 
 logger = logging.getLogger(__name__)
+health_service = HealthService()
 
 class DeduplicationService:
     def is_duplicate(self, deduplication_key: str) -> bool:
@@ -108,6 +110,14 @@ def process_webhook_event(event_id: str):
             trigger=f"WEBHOOK_{normalized.get('event_type')}",
             metadata=normalized
         )
+
+        # Record health stats
+        new_status = normalized.get('status')
+        if new_status in [TransactionStatus.CAPTURED, TransactionStatus.FAILED]:
+            health_service.record_event(
+                gateway_name=GatewayName(event.gateway_name),
+                success=(new_status == TransactionStatus.CAPTURED)
+            )
         
         event.status = WebhookEventStatus.PROCESSED
         event.processed_at = timezone.now()

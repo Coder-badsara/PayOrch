@@ -9,8 +9,10 @@ class GatewaysConfig(AppConfig):
         from .razorpay import RazorpayGateway
         from .stripe import StripeGateway
         from .upi import UPIGateway
+        from .payu import PayUGateway
 
         # Register gateways
         gateway_registry.register(RazorpayGateway())
         gateway_registry.register(StripeGateway())
         gateway_registry.register(UPIGateway())
+        gateway_registry.register(PayUGateway())

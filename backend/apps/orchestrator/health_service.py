@@ -50,6 +50,31 @@ class HealthService:
             "errors": total - successes
         }
 
+    def reset_circuit_breaker(self, gateway_name: GatewayName):
+        health = GatewayHealth.objects.filter(gateway_name=gateway_name).first()
+        if health:
+            health.status = GatewayStatus.HEALTHY
+            health.circuit_open_at = None
+            health.success_rate = 1.0
+            health.error_count = 0
+            # Also clear the sliding window in cache to start fresh
+            key = f"health:window:{gateway_name.value}"
+            cache.delete(key)
+            health.save()
+            
+            # Log the manual reset
+            GatewayHealthLog.objects.create(
+                gateway_name=gateway_name,
+                status=GatewayStatus.HEALTHY,
+                success_rate=1.0,
+                avg_latency_ms=health.avg_latency_ms,
+                error_count=0,
+                total_count=health.total_count,
+                snapshot={"event": "MANUAL_RESET"}
+            )
+            return True
+        return False
+
     def _update_health_record(self, gateway_name: GatewayName, stats: dict):
         health, created = GatewayHealth.objects.get_or_create(gateway_name=gateway_name)
         
@@ -67,14 +92,32 @@ class HealthService:
             new_status = GatewayStatus.UNHEALTHY
 
         # Circuit Breaker Logic
-        if new_status == GatewayStatus.UNHEALTHY:
-            health.status = GatewayStatus.CIRCUIT_OPEN
+        cooldown_period = getattr(settings, 'CIRCUIT_BREAKER_COOLDOWN_SECONDS', 60)
+        
+        if health.status == GatewayStatus.CIRCUIT_OPEN:
+            # Check if cooldown has passed
+            if health.circuit_open_at:
+                elapsed = (timezone.now() - health.circuit_open_at).total_seconds()
+                if elapsed >= cooldown_period:
+                    # Move to DEGRADED (acting as Half-Open) to allow test traffic
+                    # This allows the router to pick it up again
+                    new_status = GatewayStatus.DEGRADED
+                    health.circuit_open_at = None
+                    logger.info(f"Gateway {gateway_name} auto-recovered to DEGRADED after cooldown.")
+                else:
+                    new_status = GatewayStatus.CIRCUIT_OPEN
+            else:
+                # Should not happen if state is consistent, but for safety:
+                new_status = GatewayStatus.CIRCUIT_OPEN
+        elif success_rate < unhealthy_threshold:
+            new_status = GatewayStatus.CIRCUIT_OPEN
             health.circuit_open_at = health.circuit_open_at or timezone.now()
+            logger.warning(f"Gateway {gateway_name} circuit opened due to low success rate: {success_rate}")
         else:
             health.status = new_status
             health.circuit_open_at = None
 
-        health.success_rate = success_rate
+        health.status = new_status
         health.avg_latency_ms = stats['avg_latency']
         health.p95_latency_ms = stats['p95_latency']
         health.total_count = stats['total']

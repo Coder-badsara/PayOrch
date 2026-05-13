@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { getGatewayHealth } from '../api/api';
+import { getGatewayHealth, resetGatewayCircuit } from '../api/api';
 import type { GatewayHealth as GatewayHealthType } from '../types';
-import { RefreshCcw, Activity, Shield, ShieldAlert, ShieldOff, Zap, AlertTriangle, BarChart3, Clock } from 'lucide-react';
+import { RefreshCcw, Activity, Shield, ShieldAlert, ShieldOff, Zap, AlertTriangle, BarChart3, Clock, RotateCcw } from 'lucide-react';
 
 const GatewayHealth: React.FC = () => {
   const [healthData, setHealthData] = useState<GatewayHealthType[]>([]);
@@ -9,6 +9,7 @@ const GatewayHealth: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
+  const [resettingId, setResettingId] = useState<string | null>(null);
 
   const fetchHealth = useCallback(async (isAuto = false) => {
     if (!isAuto) setLoading(true);
@@ -32,6 +33,18 @@ const GatewayHealth: React.FC = () => {
       if (!isAuto) setLoading(false);
     }
   }, []);
+
+  const handleReset = async (gatewayName: string) => {
+    setResettingId(gatewayName);
+    try {
+      await resetGatewayCircuit(gatewayName);
+      await fetchHealth(true);
+    } catch (err) {
+      console.error('Failed to reset circuit breaker:', err);
+    } finally {
+      setResettingId(null);
+    }
+  };
 
   useEffect(() => {
     fetchHealth();
@@ -144,6 +157,8 @@ const GatewayHealth: React.FC = () => {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {healthData.map((gateway) => {
             const statusInfo = getStatusInfo(gateway.status);
+            const isCircuitOpen = gateway.status === 'CIRCUIT_OPEN';
+
             return (
               <div key={gateway.gateway_name} className={`bg-gray-950 border ${statusInfo.border} ${statusInfo.glow} rounded-2xl p-6 transition-all duration-700`}>
                 <div className="flex items-center justify-between mb-8">
@@ -159,9 +174,21 @@ const GatewayHealth: React.FC = () => {
                       </div>
                     </div>
                   </div>
-                  <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-tighter border ${statusInfo.border} ${statusInfo.bg} ${statusInfo.color}`}>
-                    {statusInfo.label}
-                  </span>
+                  <div className="flex flex-col items-end space-y-2">
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-tighter border ${statusInfo.border} ${statusInfo.bg} ${statusInfo.color}`}>
+                      {statusInfo.label}
+                    </span>
+                    {isCircuitOpen && (
+                      <button
+                        onClick={() => handleReset(gateway.gateway_name)}
+                        disabled={resettingId === gateway.gateway_name}
+                        className="flex items-center space-x-1 px-2 py-1 rounded bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 text-[9px] font-black uppercase tracking-widest transition-all"
+                      >
+                        <RotateCcw size={10} className={resettingId === gateway.gateway_name ? 'animate-spin' : ''} />
+                        <span>{resettingId === gateway.gateway_name ? 'Resetting...' : 'Reset Circuit'}</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 <div className="space-y-6">

@@ -19,5 +19,7 @@ export const getWebhookLogs = (params?: { gateway?: string; start_date?: string;
 export const createPayment = (data: any) => api.post('/payments/', data);
 export const updatePaymentStatus = (paymentId: string, status: string) => 
   api.post(`/payments/${paymentId}/update_status/`, { status });
+export const resetGatewayCircuit = (gatewayName: string) => 
+  api.post('/health/gateways/', { gateway_name: gatewayName, action: 'reset' });
 
 export default api;

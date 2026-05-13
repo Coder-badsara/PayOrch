@@ -41,9 +41,15 @@ class FailoverService:
                 start_time = time.time()
                 # ... same logic ...
                 if getattr(settings, 'DEBUG', False) and getattr(settings, 'FORCE_GATEWAY_SUCCESS', False):
-                     # I'll just keep it simple for now and only mock if actually requested in the loop
-                     # but let's make it consistent.
-                     pass
+                    fake_order_id = f"mock_{preferred_gateway.value}_{uuid.uuid4().hex[:8]}"
+                    result = CreateOrderResult(
+                        gateway_order_id=fake_order_id,
+                        checkout_payload={"mock": True, "order_id": fake_order_id},
+                        raw_response={"mock": True}
+                    )
+                    self._record_attempt(payment_id, preferred_gateway, order_params, result, latency=0)
+                    routing_history.append({"gateway": preferred_gateway.value, "status": "SUCCESS"})
+                    return preferred_gateway, result, routing_history
 
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future = executor.submit(gateway.create_order, order_params)
