@@ -1,7 +1,7 @@
 from typing import Dict, Any
 from django.db import transaction
-from apps.payments.models import Payment, TransactionStatus, GatewayName
-from apps.payments.state_machine import PaymentStateMachine
+from apps.payments.models import Transaction, TransactionStatus, GatewayName
+from apps.payments.state_machine import TransactionStateMachine
 from apps.idempotency.service import IdempotencyService
 from apps.gateways.base import CreateOrderParams
 from apps.core.exceptions import AllGatewaysFailedError, InvalidStateTransitionError
@@ -23,38 +23,36 @@ class OrchestratorService:
         metadata: Dict[str, Any] = None
     ) -> Dict[str, Any]:
         # 1. Check idempotency
+        # Note: PDF A4.1 says use database-level advisory lock
         idem_result = self.idempotency_service.check_or_create(idempotency_key)
         if idem_result["hit"]:
             record = idem_result["record"]
-            return {
-                "payment_id": record.payment_id,
-                "status": record.status,
-                "response": record.response_body,
-                "replayed": True
-            }
+            response = record.response_body or {}
+            response["replayed"] = True
+            return response
 
-        payment = None
+        txn = None
         try:
-            # 2. Create payment + transition INITIATED -> PENDING_GATEWAY
-            # This transaction must commit before the gateway call.
+            # 2. Create Transaction + transition CREATED -> ROUTE_SELECTED
             with transaction.atomic():
-                payment = Payment.objects.create(
+                txn = Transaction.objects.create(
                     idempotency_key=idempotency_key,
                     amount=amount,
                     currency=currency,
                     metadata=metadata or {},
                 )
-                fsm = PaymentStateMachine(payment)
+                fsm = TransactionStateMachine(txn)
+
                 fsm.transition_to(
-                    TransactionStatus.PENDING_GATEWAY,
-                    trigger="PAYMENT_INITIATED"
+                    TransactionStatus.ROUTE_SELECTED,
+                    event="TRANSACTION_INITIATED"
                 )
 
-            # 3. Call gateway outside any transaction
+            # 3. Intelligent Routing (Day 7-8 tasks will improve this)
             order_params = CreateOrderParams(
                 amount=amount,
                 currency=currency,
-                receipt=str(payment.id),
+                receipt=str(txn.id),
                 notes=metadata or {}
             )
 
@@ -63,32 +61,34 @@ class OrchestratorService:
                 try:
                     preferred_gateway = GatewayName(metadata["preferred_gateway"])
                 except ValueError:
-                    logger.warning(f"Ignoring invalid preferred gateway {metadata['preferred_gateway']} for payment {payment.id}")
+                    logger.warning(f"Ignoring invalid preferred gateway {metadata['preferred_gateway']} for txn {txn.id}")
 
+            # 4. Failover Logic
             gateway_name, result, routing_history = self.failover_service.execute_with_failover(
-                payment_id=str(payment.id),
+                transaction_id=str(txn.id),
                 amount=amount,
                 currency=currency,
-                order_params=order_params
-                , preferred_gateway=preferred_gateway
+                order_params=order_params,
+                preferred_gateway=preferred_gateway
             )
 
-            # 4. Success -> transition PENDING_GATEWAY -> PROCESSING
+            # 5. Success -> transition ROUTE_SELECTED -> AUTH_INITIATED
             with transaction.atomic():
-                locked_payment = Payment.objects.select_for_update().get(id=payment.id)
-                fsm = PaymentStateMachine(locked_payment)
+                locked_txn = Transaction.objects.select_for_update().get(id=txn.id)
+                fsm = TransactionStateMachine(locked_txn)
                 fsm.transition_to(
-                    TransactionStatus.PROCESSING,
-                    trigger="GATEWAY_ORDER_CREATED"
+                    TransactionStatus.AUTH_INITIATED,
+                    event="GATEWAY_ORDER_CREATED",
+                    gateway_reference=result.gateway_order_id,
+                    gateway_response=result.checkout_payload
                 )
-                locked_payment.gateway_name = gateway_name
-                locked_payment.gateway_order_id = result.gateway_order_id
-                locked_payment.save()
-                payment = locked_payment
+                locked_txn.gateway_name = gateway_name
+                locked_txn.save()
+                txn = locked_txn
 
             response_data = {
-                "payment_id": str(payment.id),
-                "status": payment.status,
+                "id": str(txn.id),
+                "status": txn.state,
                 "gateway": gateway_name.value,
                 "gateway_order_id": result.gateway_order_id,
                 "checkout_payload": result.checkout_payload,
@@ -96,59 +96,61 @@ class OrchestratorService:
                 "routing_history": routing_history
             }
 
-            # 5. Finalize idempotency
+            # 6. Finalize idempotency
             self.idempotency_service.finalize(
                 key=idempotency_key,
-                payment_id=str(payment.id),
-                status=payment.status,
+                transaction_id=str(txn.id),
+                status=txn.state,
                 response_body=response_data
             )
 
             return response_data
 
         except AllGatewaysFailedError as exc:
-            # All gateways failed -> transition to FAILED
-            if payment:
+            if txn:
                 try:
                     with transaction.atomic():
-                        locked_payment = Payment.objects.select_for_update().get(id=payment.id)
-                        fsm = PaymentStateMachine(locked_payment)
+                        locked_txn = Transaction.objects.select_for_update().get(id=txn.id)
+                        fsm = TransactionStateMachine(locked_txn)
+                        if locked_txn.state == TransactionStatus.ROUTE_SELECTED:
+                            fsm.transition_to(
+                                TransactionStatus.ROUTE_FAILED,
+                                event="ALL_GATEWAYS_FAILED",
+                                metadata={"error": str(exc)}
+                            )
                         fsm.transition_to(
                             TransactionStatus.FAILED,
-                            trigger="ALL_GATEWAYS_FAILED",
+                            event="ALL_GATEWAYS_FAILED",
                             metadata={"error": str(exc)}
                         )
                 except InvalidStateTransitionError:
-                    logger.info(f"Payment {payment.id} already in terminal state {payment.status}")
+                    pass
 
-            logger.error(f"Payment initiation failed for key {idempotency_key}: {str(exc)}")
+            logger.error(f"Txn initiation failed for key {idempotency_key}: {str(exc)}")
             self.idempotency_service.invalidate(idempotency_key)
             raise
 
         except Exception as exc:
-            logger.error(f"Payment initiation failed for key {idempotency_key}: {str(exc)}")
-            if payment:
+            logger.error(f"Txn initiation failed for key {idempotency_key}: {str(exc)}")
+            if txn:
                 try:
                     with transaction.atomic():
-                        locked_payment = Payment.objects.select_for_update().get(id=payment.id)
-                        fsm = PaymentStateMachine(locked_payment)
-                        terminal_states = [
-                            TransactionStatus.FAILED,
-                            TransactionStatus.CANCELLED,
-                            TransactionStatus.CAPTURED,
-                            TransactionStatus.REFUNDED,
-                            TransactionStatus.PARTIALLY_REFUNDED,
-                            TransactionStatus.EXPIRED,
-                            TransactionStatus.DISPUTED,
-                        ]
-                        if locked_payment.status not in terminal_states:
+                        locked_txn = Transaction.objects.select_for_update().get(id=txn.id)
+                        fsm = TransactionStateMachine(locked_txn)
+                        if locked_txn.state not in [TransactionStatus.FAILED, TransactionStatus.CAPTURED]:
+                            if locked_txn.state == TransactionStatus.ROUTE_SELECTED:
+                                fsm.transition_to(
+                                    TransactionStatus.ROUTE_FAILED,
+                                    event="SYSTEM_ERROR",
+                                    metadata={"error": str(exc)}
+                                )
                             fsm.transition_to(
                                 TransactionStatus.FAILED,
-                                trigger="SYSTEM_ERROR",
+                                event="SYSTEM_ERROR",
                                 metadata={"error": str(exc)}
                             )
                 except InvalidStateTransitionError:
-                    logger.info(f"Payment {payment.id} already in terminal state {payment.status}")
+                    pass
 
             self.idempotency_service.invalidate(idempotency_key)
             raise

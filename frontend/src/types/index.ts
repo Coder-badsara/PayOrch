@@ -3,7 +3,7 @@ export interface Transaction {
   idempotency_key: string;
   amount: number;
   currency: string;
-  status: 'INITIATED' | 'PENDING_GATEWAY' | 'PROCESSING' | 'SUCCESS' | 'FAILED' | 'REFUNDED' | 'CAPTURED';
+  status: 'INITIATED' | 'PENDING_GATEWAY' | 'PROCESSING' | 'SUCCESS' | 'FAILED' | 'ROUTE_FAILED' | 'REFUNDED' | 'CAPTURED';
   gateway_name: string;
   created_at: string;
   updated_at: string;

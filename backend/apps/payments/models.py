@@ -1,5 +1,6 @@
 from django.db import models
 import uuid
+from apps.core.utils import generate_16_char_id
 
 class GatewayName(models.TextChoices):
     RAZORPAY = 'RAZORPAY', 'Razorpay'
@@ -8,29 +9,30 @@ class GatewayName(models.TextChoices):
     UPI = 'UPI', 'UPI'
 
 class TransactionStatus(models.TextChoices):
-    INITIATED = 'INITIATED', 'Initiated'
-    PENDING_GATEWAY = 'PENDING_GATEWAY', 'Pending Gateway'
-    PROCESSING = 'PROCESSING', 'Processing'
-    AUTHORIZED = 'AUTHORIZED', 'Authorized'
+    CREATED = 'CREATED', 'Created'
+    ROUTE_SELECTED = 'ROUTE_SELECTED', 'Route Selected'
+    ROUTE_FAILED = 'ROUTE_FAILED', 'Route Failed'
+    AUTH_INITIATED = 'AUTH_INITIATED', 'Auth Initiated'
+    AUTHORISED = 'AUTHORISED', 'Authorised'
+    AUTH_FAILED = 'AUTH_FAILED', 'Auth Failed'
+    CAPTURE_INITIATED = 'CAPTURE_INITIATED', 'Capture Initiated'
     CAPTURED = 'CAPTURED', 'Captured'
     PARTIALLY_CAPTURED = 'PARTIALLY_CAPTURED', 'Partially Captured'
-    FAILED = 'FAILED', 'Failed'
-    CANCELLED = 'CANCELLED', 'Cancelled'
+    CAPTURE_FAILED = 'CAPTURE_FAILED', 'Capture Failed'
     REFUND_INITIATED = 'REFUND_INITIATED', 'Refund Initiated'
     REFUNDED = 'REFUNDED', 'Refunded'
-    PARTIALLY_REFUNDED = 'PARTIALLY_REFUNDED', 'Partially Refunded'
-    DISPUTED = 'DISPUTED', 'Disputed'
-    EXPIRED = 'EXPIRED', 'Expired'
+    FAILED = 'FAILED', 'Failed'
 
-class Payment(models.Model):
+class Transaction(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    merchant_order_id = models.CharField(max_length=255, db_index=True)
     idempotency_key = models.CharField(max_length=255, unique=True, db_index=True)
-    amount = models.IntegerField()  # smallest currency unit
+    amount = models.BigIntegerField()  # Store in smallest unit (paise/cents)
     currency = models.CharField(max_length=3, default='INR')
-    status = models.CharField(
+    state = models.CharField(
         max_length=20, 
         choices=TransactionStatus.choices, 
-        default=TransactionStatus.INITIATED,
+        default=TransactionStatus.CREATED,
         db_index=True
     )
     gateway_name = models.CharField(
@@ -40,25 +42,22 @@ class Payment(models.Model):
         blank=True,
         db_index=True
     )
-    gateway_order_id = models.CharField(max_length=255, null=True, blank=True)
-    gateway_payment_id = models.CharField(max_length=255, null=True, blank=True)
-    gateway_signature = models.CharField(max_length=255, null=True, blank=True)
+    gateway_reference = models.CharField(max_length=255, null=True, blank=True, db_index=True)
     metadata = models.JSONField(null=True, blank=True)
-    failover_count = models.IntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         indexes = [
-            models.Index(fields=['gateway_name', 'status']),
+            models.Index(fields=['gateway_name', 'state']),
         ]
 
-class PaymentAttempt(models.Model):
+class GatewayRoute(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    payment = models.ForeignKey(Payment, on_delete=models.CASCADE, related_name='attempts')
+    transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name='attempts')
     gateway_name = models.CharField(max_length=20, choices=GatewayName.choices, db_index=True)
     gateway_order_id = models.CharField(max_length=255, null=True, blank=True)
-    status = models.CharField(max_length=20, choices=TransactionStatus.choices)
+    state = models.CharField(max_length=20, choices=TransactionStatus.choices)
     request_payload = models.JSONField()
     response_payload = models.JSONField(null=True, blank=True)
     error_code = models.CharField(max_length=100, null=True, blank=True)
@@ -68,21 +67,24 @@ class PaymentAttempt(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-class StateTransition(models.Model):
+class TransactionStateLog(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    payment = models.ForeignKey(Payment, on_delete=models.CASCADE, related_name='state_history')
-    from_status = models.CharField(max_length=20, choices=TransactionStatus.choices)
-    to_status = models.CharField(max_length=20, choices=TransactionStatus.choices)
-    trigger = models.CharField(max_length=255)
-    metadata = models.JSONField(null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name='state_history')
+    from_state = models.CharField(max_length=20, choices=TransactionStatus.choices)
+    to_state = models.CharField(max_length=20, choices=TransactionStatus.choices)
+    event = models.CharField(max_length=100)
+    gateway_reference = models.CharField(max_length=255, null=True, blank=True)
+    gateway_response = models.JSONField(null=True, blank=True) # Full payload (PII redacted)
+    metadata = models.JSONField(null=True, blank=True) # IP, user agent, etc.
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    created_by = models.CharField(max_length=100) # System or user (e.g. webhook_processor)
 
 class Refund(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    payment = models.ForeignKey(Payment, on_delete=models.CASCADE, related_name='refunds')
-    amount = models.IntegerField()
-    gateway_refund_id = models.CharField(max_length=255, null=True, blank=True)
-    status = models.CharField(max_length=50, default='INITIATED')
+    transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name='refunds')
+    amount = models.BigIntegerField()
+    gateway_refund_id = models.CharField(max_length=255, null=True, blank=True, db_index=True)
+    state = models.CharField(max_length=50, default='INITIATED')
     reason = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

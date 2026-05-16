@@ -1,140 +1,151 @@
 from django.core.management.base import BaseCommand
-from apps.orchestrator.models import RoutingRule, RoutingStrategy, GatewayHealth
-from apps.payments.models import Payment, PaymentAttempt, GatewayName, TransactionStatus
-from apps.webhooks.models import WebhookEvent, WebhookEventStatus
 from django.utils import timezone
+from apps.payments.models import Transaction, GatewayRoute, GatewayName, TransactionStatus
+from apps.webhooks.models import ProcessedWebhookEvent, WebhookQueue
+from apps.orchestrator.models import GatewayHealthMetrics, CircuitBreaker, GatewayConfig, RoutingConfig
 import uuid
+import random
+import hashlib
 
 class Command(BaseCommand):
     help = 'Seed initial data for testing the Payment Orchestration System'
 
-    def handle(self, *args, **options):
+    def handle(self, *args, **kwargs):
         self.stdout.write('Seeding data...')
 
-        # 1. Create Default Routing Rule
-        rule, created = RoutingRule.objects.get_or_create(
-            name='Default Weighted Rule',
-            defaults={
-                'strategy': RoutingStrategy.WEIGHTED,
-                'priority': 100,
-                'conditions': {'currency': ['INR', 'USD']},
-                'gateway_weights': {
-                    'RAZORPAY': {'weight': 0.5, 'priority': 1},
-                    'STRIPE': {'weight': 0.2, 'priority': 2},
-                    'PAYU': {'weight': 0.2, 'priority': 3},
-                    'UPI': {'weight': 0.1, 'priority': 4}
-                },
-                'is_active': True
-            }
-        )
-        if created:
-            self.stdout.write(self.style.SUCCESS('Created default routing rule'))
-
-        # 2. Create Initial Gateway Health Records
-        for g_name in GatewayName:
-            GatewayHealth.objects.get_or_create(
-                gateway_name=g_name,
+        # 1. Seed Gateway Configs (REQUIRED for Auto-Route)
+        for gateway in GatewayName:
+            GatewayConfig.objects.get_or_create(
+                gateway_name=gateway.value,
                 defaults={
-                    'status': 'HEALTHY',
-                    'success_rate': 1.0,
-                    'avg_latency_ms': 200.0,
-                    'last_checked_at': timezone.now()
+                    'connection_details': {'mock': True},
+                    'is_active': True
+                }
+            )
+        
+        # 2. Seed Routing Weights (REQUIRED for Auto-Route Scoring)
+        routing_weights = {
+            'success_rate_weight': 0.35,
+            'latency_weight': 0.20,
+            'cost_weight': 0.20,
+            'health_weight': 0.15,
+            'fit_weight': 0.10
+        }
+        for key, value in routing_weights.items():
+            RoutingConfig.objects.get_or_create(
+                config_key=key,
+                defaults={'value': value}
+            )
+
+        # 3. Seed Circuit Breakers
+        for gateway in GatewayName:
+            CircuitBreaker.objects.get_or_create(
+                gateway=gateway.value,
+                payment_method='ALL',
+                defaults={
+                    'state': CircuitBreaker.State.CLOSED,
+                    'failure_threshold': 5,
+                    'recovery_timeout_seconds': 30
                 }
             )
 
-        # 3. Seed some Sample Payments
-        p1, _ = Payment.objects.get_or_create(
-            idempotency_key=str(uuid.uuid4()),
+        # 4. Seed Gateway Health Metrics (Historical Data Simulation - A3.4)
+        for gateway in GatewayName:
+            for _ in range(10):
+                GatewayHealthMetrics.objects.create(
+                    gateway=gateway.value,
+                    success_rate=random.uniform(0.9, 1.0),
+                    p95_latency_ms=random.randint(100, 500),
+                    error_rate=random.uniform(0.0, 0.05),
+                    recorded_at=timezone.now() - timezone.timedelta(minutes=random.randint(1, 1440))
+                )
+
+        # 5. Seed some Sample Transactions
+        t1, _ = Transaction.objects.get_or_create(
+            idempotency_key='idem_123',
             defaults={
-                'amount': 50000, # 500 INR
+                'merchant_order_id': 'ORD_001',
+                'amount': 50000, # 500.00 INR
                 'currency': 'INR',
-                'status': TransactionStatus.CAPTURED,
+                'state': TransactionStatus.CAPTURED,
                 'gateway_name': GatewayName.RAZORPAY,
-                'gateway_order_id': 'order_live_123',
-                'gateway_payment_id': 'pay_live_456'
+                'gateway_reference': 'pay_live_456'
             }
         )
 
-        PaymentAttempt.objects.get_or_create(
-            payment=p1,
+        GatewayRoute.objects.get_or_create(
+            transaction=t1,
             gateway_name=GatewayName.RAZORPAY,
             defaults={
-                'status': TransactionStatus.CAPTURED,
+                'state': TransactionStatus.CAPTURED,
                 'request_payload': {'amount': 50000},
-                'response_payload': {'id': 'pay_live_456', 'status': 'captured'},
-                'latency_ms': 450
+                'response_payload': {'id': 'pay_live_456'},
+                'latency_ms': 240
             }
         )
 
-        p2, _ = Payment.objects.get_or_create(
-            idempotency_key=str(uuid.uuid4()),
+        t2, _ = Transaction.objects.get_or_create(
+            idempotency_key='idem_456',
             defaults={
-                'amount': 100000, # 1000 INR
+                'merchant_order_id': 'ORD_002',
+                'amount': 120000,
                 'currency': 'INR',
-                'status': TransactionStatus.FAILED,
+                'state': TransactionStatus.FAILED,
                 'gateway_name': GatewayName.STRIPE,
-                'failover_count': 1
+                'gateway_reference': 'pi_789'
             }
         )
 
-        # Record a failed attempt
-        PaymentAttempt.objects.get_or_create(
-            payment=p2,
+        GatewayRoute.objects.get_or_create(
+            transaction=t2,
             gateway_name=GatewayName.STRIPE,
             defaults={
-                'status': TransactionStatus.FAILED,
-                'request_payload': {'amount': 100000},
-                'error_code': 'CARD_DECLINED',
-                'error_message': 'Your card was declined.',
-                'latency_ms': 1200
+                'state': TransactionStatus.FAILED,
+                'request_payload': {'amount': 120000},
+                'response_payload': {'error': 'card_declined'},
+                'error_code': 'card_declined',
+                'latency_ms': 1100
             }
         )
 
-        # 4. Seed Webhook Events
-        webhook1, created1 = WebhookEvent.objects.get_or_create(
-            deduplication_key='evt_razorpay_123',
-            defaults={
-                'gateway_name': GatewayName.RAZORPAY,
-                'event_type': 'payment.captured',
-                'gateway_event_id': 'evt_123',
-                'payment': p1,
-                'raw_payload': {'event': 'payment.captured', 'payload': {'payment': {'entity': {'id': 'pay_live_456'}}}},
-                'status': WebhookEventStatus.PROCESSED,
-                'signature_valid': True,
-                'processed_at': timezone.now()
-            }
-        )
-        if created1:
-            self.stdout.write(self.style.SUCCESS('Created Razorpay webhook event'))
+        # 6. Seed diverse Webhook data
+        self.stdout.write('Seeding webhooks...')
+        
+        gateways = [gateway.value for gateway in GatewayName]
+        event_types = ['payment.captured', 'payment.failed', 'refund.processed', 'chargeback.opened']
+        
+        # Seed 20 Processed Webhook Events (History)
+        for i in range(20):
+            gw = random.choice(gateways)
+            evt_id = f'evt_{gw.lower()}_{random.randint(1000, 9999)}'
+            evt_type = random.choice(event_types)
+            
+            ProcessedWebhookEvent.objects.get_or_create(
+                gateway=gw,
+                event_id=evt_id,
+                defaults={
+                    'event_type': evt_type,
+                    'payload_hash': hashlib.sha256(f"{evt_id}_{i}".encode()).hexdigest(),
+                    'transaction': t1 if i == 0 else None
+                }
+            )
 
-        webhook2, created2 = WebhookEvent.objects.get_or_create(
-            deduplication_key='evt_stripe_456',
-            defaults={
-                'gateway_name': GatewayName.STRIPE,
-                'event_type': 'payment_intent.payment_failed',
-                'gateway_event_id': 'evt_456',
-                'payment': p2,
-                'raw_payload': {'type': 'payment_intent.payment_failed', 'data': {'object': {'id': 'pi_789'}}},
-                'status': WebhookEventStatus.PROCESSED,
-                'signature_valid': True,
-                'processed_at': timezone.now()
-            }
-        )
-        if created2:
-            self.stdout.write(self.style.SUCCESS('Created Stripe webhook event'))
+        # Seed 10 Webhook Queue items (Pending/Failed/Processing)
+        statuses = [WebhookQueue.Status.PENDING, WebhookQueue.Status.FAILED, WebhookQueue.Status.COMPLETED, WebhookQueue.Status.PROCESSING]
+        for i in range(10):
+            gw = random.choice(gateways)
+            evt_id = f'q_evt_{gw.lower()}_{random.randint(1000, 9999)}'
+            
+            WebhookQueue.objects.get_or_create(
+                gateway=gw,
+                event_id=evt_id,
+                defaults={
+                    'payload': {'id': evt_id, 'amount': 1000, 'currency': 'INR', 'status': 'captured'},
+                    'signature': f'sig_{random.randint(10000, 99999)}',
+                    'status': random.choice(statuses),
+                    'retry_count': random.randint(0, 2),
+                    'error_message': 'Connection timeout' if i % 4 == 0 else None
+                }
+            )
 
-        webhook3, created3 = WebhookEvent.objects.get_or_create(
-            deduplication_key='evt_unknown_789',
-            defaults={
-                'gateway_name': GatewayName.RAZORPAY,
-                'event_type': 'order.paid',
-                'gateway_event_id': 'evt_789',
-                'raw_payload': {'event': 'order.paid', 'payload': {'order': {'entity': {'id': 'order_abc'}}}},
-                'status': WebhookEventStatus.RECEIVED,
-                'signature_valid': True
-            }
-        )
-        if created3:
-            self.stdout.write(self.style.SUCCESS('Created unknown Razorpay webhook event'))
-
-        self.stdout.write(self.style.SUCCESS('Successfully seeded development data'))
+        self.stdout.write(self.style.SUCCESS('Successfully seeded initial data'))

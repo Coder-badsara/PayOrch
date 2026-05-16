@@ -1,102 +1,105 @@
 from django.db import transaction, models
-from apps.payments.models import Payment, TransactionStatus, StateTransition
+from apps.payments.models import Transaction, TransactionStatus, TransactionStateLog
 from apps.core.exceptions import InvalidStateTransitionError
 import logging
 
 logger = logging.getLogger(__name__)
 
-class PaymentStateMachine:
-    def __init__(self, payment: Payment):
-        self.payment = payment
+class TransactionStateMachine:
+    def __init__(self, transaction_obj: Transaction):
+        self.transaction_obj = transaction_obj
 
-    def transition_to(self, to_status: TransactionStatus, trigger: str, metadata: dict = None):
-        from_status = self.payment.status
+    def transition_to(self, to_state: TransactionStatus, event: str, gateway_reference: str = None, 
+                      gateway_response: dict = None, metadata: dict = None, created_by: str = "system"):
+        from_state = self.transaction_obj.state
         
         # 1. Validate transition
-        if not self._is_valid_transition(from_status, to_status):
-            raise InvalidStateTransitionError(from_status, to_status)
+        if not self._is_valid_transition(from_state, to_state):
+            raise InvalidStateTransitionError(from_state, to_state)
 
-        # 2. Execute with optimistic locking
+        # 2. Execute with pessimistic locking
         with transaction.atomic():
             # Refresh from DB to ensure we have the latest status
-            # Select for update to lock the row
-            locked_payment = Payment.objects.select_for_update().get(id=self.payment.id)
+            locked_txn = Transaction.objects.select_for_update().get(id=self.transaction_obj.id)
             
-            if locked_payment.status != from_status:
-                logger.warning(f"Concurrent modification detected for payment {self.payment.id}")
-                # We can either retry or throw error. Spec says throw error.
-                raise InvalidStateTransitionError(locked_payment.status, to_status)
+            if locked_txn.state != from_state:
+                logger.warning(f"Concurrent modification detected for transaction {self.transaction_obj.id}")
+                raise InvalidStateTransitionError(locked_txn.state, to_state)
 
             # Update status
-            locked_payment.status = to_status
-            locked_payment.save()
+            locked_txn.state = to_state
+            if gateway_reference:
+                locked_txn.gateway_reference = gateway_reference
+            locked_txn.save()
 
-            # Record history
-            StateTransition.objects.create(
-                payment=locked_payment,
-                from_status=from_status,
-                to_status=to_status,
-                trigger=trigger,
-                metadata=metadata
+            # Record history (Audit Trail - A2.3)
+            TransactionStateLog.objects.create(
+                transaction=locked_txn,
+                from_state=from_state,
+                to_state=to_state,
+                event=event,
+                gateway_reference=gateway_reference or locked_txn.gateway_reference,
+                gateway_response=gateway_response,
+                metadata=metadata,
+                created_by=created_by
             )
             
-            self.payment = locked_payment
+            self.transaction_obj = locked_txn
             
-        logger.info(f"Payment {self.payment.id} transitioned from {from_status} to {to_status} via {trigger}")
+        logger.info(f"Transaction {self.transaction_obj.id} transitioned from {from_state} to {to_state} via {event}")
 
-    def _is_valid_transition(self, from_status: TransactionStatus, to_status: TransactionStatus) -> bool:
+    def _is_valid_transition(self, from_state: TransactionStatus, to_state: TransactionStatus) -> bool:
+        # Strictly following PDF A2.2 table
         valid_transitions = {
-            TransactionStatus.INITIATED: [
-                TransactionStatus.PENDING_GATEWAY, 
-                TransactionStatus.CANCELLED, 
-                TransactionStatus.EXPIRED
+            TransactionStatus.CREATED: [
+                TransactionStatus.ROUTE_SELECTED, 
+                # TransactionStatus.ABANDONED (Considered state)
             ],
-            TransactionStatus.PENDING_GATEWAY: [
-                TransactionStatus.PROCESSING, 
-                TransactionStatus.FAILED, 
-                TransactionStatus.CANCELLED
+            TransactionStatus.ROUTE_SELECTED: [
+                TransactionStatus.ROUTE_FAILED,
+                TransactionStatus.AUTH_INITIATED,
             ],
-            TransactionStatus.PROCESSING: [
-                TransactionStatus.AUTHORIZED, 
-                TransactionStatus.CAPTURED, 
-                TransactionStatus.FAILED, 
-                TransactionStatus.CANCELLED
+            TransactionStatus.ROUTE_FAILED: [
+                TransactionStatus.FAILED,
             ],
-            TransactionStatus.AUTHORIZED: [
-                TransactionStatus.CAPTURED, 
-                TransactionStatus.PARTIALLY_CAPTURED, 
-                TransactionStatus.CANCELLED, 
-                TransactionStatus.EXPIRED
+            TransactionStatus.AUTH_INITIATED: [
+                TransactionStatus.AUTHORISED,
+                TransactionStatus.AUTH_FAILED,
+                # TransactionStatus.AUTH_TIMEOUT (Considered state)
             ],
-            TransactionStatus.CAPTURED: [
-                TransactionStatus.REFUND_INITIATED, 
-                TransactionStatus.DISPUTED
+            TransactionStatus.AUTHORISED: [
+                TransactionStatus.CAPTURE_INITIATED,
+                # TransactionStatus.VOID_INITIATED, TransactionStatus.AUTH_EXPIRED
             ],
-            TransactionStatus.PARTIALLY_CAPTURED: [
-                TransactionStatus.CAPTURED, 
-                TransactionStatus.REFUND_INITIATED, 
-                TransactionStatus.DISPUTED
-            ],
-            TransactionStatus.FAILED: [
-                TransactionStatus.PENDING_GATEWAY  # allow retry
-            ],
-            TransactionStatus.CANCELLED: [],
-            TransactionStatus.REFUND_INITIATED: [
-                TransactionStatus.REFUNDED, 
-                TransactionStatus.PARTIALLY_REFUNDED, 
+            TransactionStatus.AUTH_FAILED: [
+                TransactionStatus.ROUTE_SELECTED, # retry
                 TransactionStatus.FAILED
             ],
-            TransactionStatus.REFUNDED: [],
-            TransactionStatus.PARTIALLY_REFUNDED: [
-                TransactionStatus.REFUNDED, 
-                TransactionStatus.REFUND_INITIATED
+            TransactionStatus.CAPTURE_INITIATED: [
+                TransactionStatus.CAPTURED,
+                TransactionStatus.CAPTURE_FAILED,
+                TransactionStatus.PARTIALLY_CAPTURED
             ],
-            TransactionStatus.DISPUTED: [
-                TransactionStatus.CAPTURED, 
-                TransactionStatus.REFUNDED
+            TransactionStatus.CAPTURED: [
+                TransactionStatus.REFUND_INITIATED,
+                # TransactionStatus.SETTLED
             ],
-            TransactionStatus.EXPIRED: [],
+            TransactionStatus.PARTIALLY_CAPTURED: [
+                TransactionStatus.CAPTURE_INITIATED, # retry/remainder
+                TransactionStatus.REFUND_INITIATED,
+                # TransactionStatus.SETTLED
+            ],
+            TransactionStatus.CAPTURE_FAILED: [
+                TransactionStatus.CAPTURE_INITIATED, # retry
+                # TransactionStatus.VOID_INITIATED
+            ],
+            TransactionStatus.REFUND_INITIATED: [
+                TransactionStatus.REFUNDED,
+                # TransactionStatus.PARTIALLY_REFUNDED, TransactionStatus.REFUND_FAILED
+            ],
+            TransactionStatus.REFUNDED: [], # Terminal
+            TransactionStatus.FAILED: [], # Terminal
         }
         
-        allowed = valid_transitions.get(from_status, [])
-        return to_status in allowed
+        allowed = valid_transitions.get(from_state, [])
+        return to_state in allowed

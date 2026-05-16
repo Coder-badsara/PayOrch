@@ -1,40 +1,45 @@
 from django.db import models
 import uuid
-from apps.payments.models import GatewayName, Payment, TransactionStatus
+from apps.payments.models import GatewayName, Transaction
 
-class WebhookEventStatus(models.TextChoices):
-    RECEIVED = 'RECEIVED', 'Received'
-    PROCESSING = 'PROCESSING', 'Processing'
-    PROCESSED = 'PROCESSED', 'Processed'
-    FAILED = 'FAILED', 'Failed'
-    DUPLICATE = 'DUPLICATE', 'Duplicate'
-    IGNORED = 'IGNORED', 'Ignored'
+class ProcessedWebhookEvent(models.Model):
+    gateway = models.CharField(max_length=50)
+    event_id = models.CharField(max_length=255)
+    event_type = models.CharField(max_length=100)
+    payload_hash = models.CharField(max_length=64)
+    transaction = models.ForeignKey(Transaction, on_delete=models.SET_NULL, null=True, blank=True)
+    processed_at = models.DateTimeField(auto_now_add=True)
 
-class WebhookEvent(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    gateway_name = models.CharField(max_length=20, choices=GatewayName.choices, db_index=True)
-    event_type = models.CharField(max_length=100, db_index=True)
-    gateway_event_id = models.CharField(max_length=255, null=True, blank=True)
-    payment = models.ForeignKey(Payment, on_delete=models.SET_NULL, null=True, blank=True, related_name='webhook_events')
-    raw_payload = models.JSONField()
-    normalized_payload = models.JSONField(null=True, blank=True)
-    status = models.CharField(max_length=20, choices=WebhookEventStatus.choices, default=WebhookEventStatus.RECEIVED, db_index=True)
-    signature_valid = models.BooleanField(null=True, blank=True)
-    deduplication_key = models.CharField(max_length=255, unique=True, db_index=True)
-    processing_error = models.TextField(null=True, blank=True)
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['gateway', 'event_id'], name='unique_gateway_event')
+        ]
+
+class WebhookQueue(models.Model):
+    class Status(models.TextChoices):
+        PENDING = 'PENDING', 'Pending'
+        PROCESSING = 'PROCESSING', 'Processing'
+        COMPLETED = 'COMPLETED', 'Completed'
+        FAILED = 'FAILED', 'Failed'
+        DLQ = 'DLQ', 'Dead Letter Queue'
+
+    gateway = models.CharField(max_length=50)
+    event_id = models.CharField(max_length=255)
+    payload = models.JSONField()
+    signature = models.TextField()
+    status = models.CharField(
+        max_length=20, 
+        choices=Status.choices, 
+        default=Status.PENDING
+    )
     retry_count = models.IntegerField(default=0)
-    processed_at = models.DateTimeField(null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-class ReconciliationRecord(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    payment = models.ForeignKey(Payment, on_delete=models.CASCADE)
-    gateway_name = models.CharField(max_length=20, choices=GatewayName.choices)
-    internal_status = models.CharField(max_length=20, choices=TransactionStatus.choices)
-    gateway_status = models.CharField(max_length=100)
-    reconciled = models.BooleanField(default=False, db_index=True)
-    discrepancy = models.TextField(null=True, blank=True)
-    resolved_at = models.DateTimeField(null=True, blank=True)
+    max_retries = models.IntegerField(default=3)
+    next_retry_at = models.DateTimeField(null=True, blank=True)
+    error_message = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['next_retry_at'], name='idx_webhook_queue_pending', condition=models.Q(status__in=['PENDING', 'FAILED'])),
+        ]

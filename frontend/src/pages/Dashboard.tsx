@@ -1,24 +1,37 @@
 import React, { useEffect, useState } from 'react';
 import { getTransactions } from '../api/api';
+import { generateReceiptPDF } from '../api/pdf';
 import type { Transaction } from '../types';
 import { format } from 'date-fns';
-import { RefreshCcw, Filter } from 'lucide-react';
+import { RefreshCcw, Filter, Download, Loader2 } from 'lucide-react';
 import CustomDatePicker from '../components/CustomDatePicker';
 
 const Dashboard: React.FC = () => {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
   
   // Filter state
   const [gateway, setGateway] = useState('');
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
   
-  // Pagination state
   const [page, setPage] = useState(1);
   const [totalCount, setTotalCount] = useState(0);
   const pageSize = 10;
+
+  const handleDownload = async (tx: Transaction) => {
+    setDownloadingId(tx.id);
+    try {
+      await generateReceiptPDF(tx);
+    } catch (err) {
+      console.error('Download failed:', err);
+      alert('Failed to generate receipt PDF');
+    } finally {
+      setDownloadingId(null);
+    }
+  };
 
   const fetchTransactions = async (pageNumber = page) => {
     setLoading(true);
@@ -30,7 +43,7 @@ const Dashboard: React.FC = () => {
         end_date: endDate || undefined,
         page: pageNumber,
       });
-      
+
       const elapsed = Date.now() - startTime;
       const remaining = Math.max(0, 600 - elapsed);
       if (remaining > 0) await new Promise(resolve => setTimeout(resolve, remaining));
@@ -47,6 +60,7 @@ const Dashboard: React.FC = () => {
       setLoading(false);
     }
   };
+
 
   useEffect(() => {
     setPage(1);
@@ -65,6 +79,7 @@ const Dashboard: React.FC = () => {
       case 'CAPTURED': 
         return 'text-green-400 bg-green-400/10';
       case 'FAILED': 
+      case 'ROUTE_FAILED':
         return 'text-red-400 bg-red-400/10';
       case 'PENDING':
       case 'PROCESSING':
@@ -147,16 +162,17 @@ const Dashboard: React.FC = () => {
               <th className="px-6 py-4 font-medium">Gateway</th>
               <th className="px-6 py-4 font-medium">Status</th>
               <th className="px-6 py-4 font-medium">Created</th>
+              <th className="px-6 py-4 font-medium text-right">Actions</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-800">
             {loading && transactions.length === 0 ? (
               <tr>
-                <td colSpan={5} className="px-6 py-10 text-center text-gray-500">Loading transactions...</td>
+                <td colSpan={6} className="px-6 py-10 text-center text-gray-500">Loading transactions...</td>
               </tr>
             ) : transactions.length === 0 ? (
               <tr>
-                <td colSpan={5} className="px-6 py-10 text-center text-gray-500">No transactions found.</td>
+                <td colSpan={6} className="px-6 py-10 text-center text-gray-500">No transactions found.</td>
               </tr>
             ) : (
               transactions.map((tx) => (
@@ -180,6 +196,22 @@ const Dashboard: React.FC = () => {
                   </td>
                   <td className="px-6 py-4 text-gray-400 text-sm">
                     {format(new Date(tx.created_at), 'MMM d, yyyy HH:mm')}
+                  </td>
+                  <td className="px-6 py-4 text-right">
+                    {(tx.status === 'CAPTURED' || tx.status === 'SUCCESS') && (
+                      <button
+                        onClick={() => handleDownload(tx)}
+                        disabled={!!downloadingId}
+                        className="p-2 text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 rounded-lg transition-all disabled:opacity-50"
+                        title="Download Receipt"
+                      >
+                        {downloadingId === tx.id ? (
+                          <Loader2 size={16} className="animate-spin" />
+                        ) : (
+                          <Download size={16} />
+                        )}
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))

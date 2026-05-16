@@ -15,10 +15,10 @@ class APIKeyMiddleware:
         # Exempt paths (using path.strip('/') for consistent matching)
         path = request.path.strip('/')
         exempt_prefixes = [
-            'v1/health',
+            'api/v1/health',
+            'api/v1/webhooks',
             'metrics',
             'admin',
-            'webhooks',
         ]
         
         if any(path.startswith(prefix) for prefix in exempt_prefixes):

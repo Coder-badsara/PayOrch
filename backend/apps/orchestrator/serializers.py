@@ -1,7 +1,17 @@
 from rest_framework import serializers
-from .models import GatewayHealth
+from .models import GatewayHealthMetrics, CircuitBreaker, GatewayConfig
 
-class GatewayHealthSerializer(serializers.ModelSerializer):
+class GatewayHealthMetricsSerializer(serializers.ModelSerializer):
     class Meta:
-        model = GatewayHealth
+        model = GatewayHealthMetrics
+        fields = '__all__'
+
+class CircuitBreakerSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CircuitBreaker
+        fields = '__all__'
+
+class GatewayConfigSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = GatewayConfig
         fields = '__all__'

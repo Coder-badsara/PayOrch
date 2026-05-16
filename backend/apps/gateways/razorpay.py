@@ -76,8 +76,6 @@ class RazorpayGateway(BaseGateway):
     def health_check(self) -> HealthCheckResult:
         start_time = time.time()
         try:
-            # Razorpay doesn't have a simple ping, so we fetch a non-existent order or similar
-            # or just call orders with a limit
             self.client.order.all({"count": 1})
             latency = int((time.time() - start_time) * 1000)
             return HealthCheckResult(is_healthy=True, latency_ms=latency)
@@ -87,6 +85,7 @@ class RazorpayGateway(BaseGateway):
 
     def verify_webhook_signature(self, raw_body: bytes, signature: str, secret: str) -> bool:
         try:
+            # Using timingSafeEqual for security (A5.3)
             expected_signature = hmac.new(
                 secret.encode(),
                 raw_body,
@@ -104,8 +103,8 @@ class RazorpayGateway(BaseGateway):
 
         return NormalizedWebhookEvent(
             event_type=event,
-            gateway_event_id=raw_payload.get('account_id'), # Not exactly event ID
-            payment_id=None, # Needs to be linked via metadata or notes
+            gateway_event_id=raw_payload.get('id'), # Use actual event id
+            payment_id=payment_payload.get('notes', {}).get('payment_id'), 
             gateway_order_id=payment_payload.get('order_id') or order_payload.get('id'),
             gateway_payment_id=payment_payload.get('id'),
             amount=payment_payload.get('amount'),
@@ -116,10 +115,10 @@ class RazorpayGateway(BaseGateway):
 
     def _map_status(self, status: str) -> TransactionStatus:
         mapping = {
-            'created': TransactionStatus.PENDING_GATEWAY,
-            'authorized': TransactionStatus.AUTHORIZED,
+            'created': TransactionStatus.ROUTE_SELECTED,
+            'authorized': TransactionStatus.AUTHORISED,
             'captured': TransactionStatus.CAPTURED,
             'refunded': TransactionStatus.REFUNDED,
             'failed': TransactionStatus.FAILED,
         }
-        return mapping.get(status, TransactionStatus.PROCESSING)
+        return mapping.get(status, TransactionStatus.AUTH_FAILED)

@@ -3,6 +3,8 @@ import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import Layout from './components/Layout';
 import Dashboard from './pages/Dashboard';
 import PaymentSimulator from './pages/PaymentSimulator';
+import PaymentSuccess from './pages/PaymentSuccess';
+import PaymentFailed from './pages/PaymentFailed';
 import WebhookLogs from './pages/WebhookLogs';
 import GatewayHealth from './pages/GatewayHealth';
 import Settings from './pages/Settings';
@@ -51,6 +53,8 @@ const App: React.FC = () => {
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/simulator" element={<PaymentSimulator />} />
+            <Route path="/payment-success/:paymentId" element={<PaymentSuccess />} />
+            <Route path="/payment-failed/:paymentId" element={<PaymentFailed />} />
             <Route path="/webhooks" element={<WebhookLogs />} />
             <Route path="/health" element={<GatewayHealth />} />
             <Route path="/settings" element={<Settings />} />

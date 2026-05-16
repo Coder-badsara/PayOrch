@@ -1,5 +1,6 @@
 import stripe
 import time
+from typing import Any
 from django.conf import settings
 from apps.payments.models import GatewayName, TransactionStatus
 from .base import (
@@ -70,7 +71,6 @@ class StripeGateway(BaseGateway):
     def health_check(self) -> HealthCheckResult:
         start_time = time.time()
         try:
-            # Simple ping-like call
             stripe.Balance.retrieve()
             latency = int((time.time() - start_time) * 1000)
             return HealthCheckResult(is_healthy=True, latency_ms=latency)
@@ -105,12 +105,13 @@ class StripeGateway(BaseGateway):
 
     def _map_status(self, status: str) -> TransactionStatus:
         mapping = {
-            'requires_payment_method': TransactionStatus.PENDING_GATEWAY,
-            'requires_confirmation': TransactionStatus.PENDING_GATEWAY,
-            'requires_action': TransactionStatus.PROCESSING,
-            'processing': TransactionStatus.PROCESSING,
-            'requires_capture': TransactionStatus.AUTHORIZED,
+            'requires_payment_method': TransactionStatus.ROUTE_SELECTED,
+            'requires_confirmation': TransactionStatus.ROUTE_SELECTED,
+            'requires_action': TransactionStatus.AUTH_INITIATED,
+            'processing': TransactionStatus.AUTH_INITIATED,
+            'requires_capture': TransactionStatus.AUTHORISED,
             'succeeded': TransactionStatus.CAPTURED,
-            'canceled': TransactionStatus.CANCELLED,
+            'canceled': TransactionStatus.FAILED,
+            'failed': TransactionStatus.FAILED,
         }
-        return mapping.get(status, TransactionStatus.PROCESSING)
+        return mapping.get(status, TransactionStatus.AUTH_FAILED)

@@ -1,120 +1,99 @@
-import random
 from typing import List, Optional
 from django.db import models
-from django.core.cache import cache
+from django.utils import timezone
 from apps.payments.models import GatewayName
-from apps.gateways.registry import gateway_registry
-from .models import RoutingRule, RoutingStrategy, GatewayHealth, GatewayStatus
-from apps.core.exceptions import NoAvailableGatewayError
+from .models import GatewayConfig, RoutingConfig, GatewayHealthMetrics, CircuitBreaker
+import random
+import logging
+
+logger = logging.getLogger(__name__)
 
 class RouterService:
     def select_gateway(
         self, 
         amount: int, 
         currency: str, 
-        exclude_gateways: Optional[List[GatewayName]] = None
+        exclude_gateways: List[GatewayName] = None
     ) -> GatewayName:
         exclude_gateways = exclude_gateways or []
         
-        # 1. Match routing rule
-        rule = self._match_rule(amount, currency)
-        if not rule:
-            # Fallback to default logic if no rule matches
-            return self._fallback_selection(exclude_gateways)
+        # 1. Get all active gateways
+        available_gateways = GatewayConfig.objects.filter(is_active=True).values_list('gateway_name', flat=True)
+        available_gateways = [GatewayName(g) for g in available_gateways if GatewayName(g) not in exclude_gateways]
 
-        # 2. Filter healthy gateways from rule
-        gateway_weights = rule.gateway_weights
-        healthy_gateways = self._get_healthy_gateways(gateway_weights.keys(), exclude_gateways)
+        if not available_gateways:
+            raise Exception("No active gateways available for routing")
+
+        # 2. Filter by health (Circuit Breaker check)
+        healthy_gateways = []
+        for g_name in available_gateways:
+            cb = CircuitBreaker.objects.filter(gateway=g_name.value, payment_method='ALL').first()
+            if not cb or cb.state != CircuitBreaker.State.OPEN:
+                healthy_gateways.append(g_name)
         
         if not healthy_gateways:
-            raise NoAvailableGatewayError()
+            # Fallback to all active gateways if everything is "open" (last resort)
+            healthy_gateways = available_gateways
 
-        # 3. Apply strategy
-        if rule.strategy == RoutingStrategy.WEIGHTED:
-            return self._weighted_selection(healthy_gateways, gateway_weights)
-        elif rule.strategy == RoutingStrategy.ROUND_ROBIN:
-            return self._round_robin_selection(healthy_gateways, rule.name)
-        elif rule.strategy == RoutingStrategy.PRIORITY:
-            return self._priority_selection(healthy_gateways, gateway_weights)
-        elif rule.strategy == RoutingStrategy.COST_OPTIMIZED:
-            return self._cost_optimized_selection(healthy_gateways, gateway_weights)
+        # 3. Multi-Criteria Scoring (A3.1, A3.2)
+        scores = {}
+        weights = self._get_routing_weights()
+
+        for g_name in healthy_gateways:
+            scores[g_name] = self._calculate_score(g_name, weights, amount, currency)
+
+        # 4. Select highest score
+        # A3.2: If selected gateway is degraded, 2nd highest is preferred unless diff > 20%
+        sorted_gateways = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         
-        return healthy_gateways[0]
-
-    def _match_rule(self, amount: int, currency: str) -> Optional[RoutingRule]:
-        # Simple matching for now, can be expanded with JSONB queries
-        rules = RoutingRule.objects.filter(is_active=True).order_by('-priority')
-        for rule in rules:
-            conditions = rule.conditions
-            if 'currency' in conditions and currency not in conditions['currency']:
-                continue
-            if 'amount_min' in conditions and amount < conditions['amount_min']:
-                continue
-            if 'amount_max' in conditions and amount > conditions['amount_max']:
-                continue
-            return rule
-        return None
-
-    def _get_healthy_gateways(self, gateway_names: List[str], exclude: List[GatewayName]) -> List[GatewayName]:
-        # Filter out unhealthy and circuit-open gateways
-        health_data = GatewayHealth.objects.filter(gateway_name__in=gateway_names)
-        health_map = {h.gateway_name: h.status for h in health_data}
+        selected_gateway = sorted_gateways[0][0]
         
-        healthy = []
-        for name_str in gateway_names:
-            name = GatewayName(name_str)
-            if name in exclude:
-                continue
-            status = health_map.get(name_str, GatewayStatus.HEALTHY)
-            if status in [GatewayStatus.HEALTHY, GatewayStatus.DEGRADED]:
-                healthy.append(name)
-        return healthy
-
-    def _weighted_selection(self, healthy: List[GatewayName], weights: dict) -> GatewayName:
-        # Adjusted weights based on health
-        effective_weights = []
-        gateways = []
+        # Log decision
+        logger.info(f"Gateway selected: {selected_gateway} with score {scores[selected_gateway]}")
         
-        health_data = GatewayHealth.objects.filter(gateway_name__in=[h.value for h in healthy])
-        health_map = {h.gateway_name: h.success_rate for h in health_data}
+        return selected_gateway
 
-        for g in healthy:
-            configured_weight = weights.get(g.value, {}).get('weight', 1.0)
-            success_rate = health_map.get(g.value, 1.0)
-            effective_weights.append(configured_weight * success_rate)
-            gateways.append(g)
+    def _get_routing_weights(self):
+        # Default weights from A3.1
+        defaults = {
+            'success_rate_weight': 0.35,
+            'latency_weight': 0.20,
+            'cost_weight': 0.20,
+            'health_weight': 0.15,
+            'fit_weight': 0.10
+        }
+        configs = RoutingConfig.objects.all()
+        for c in configs:
+            if c.config_key in defaults:
+                defaults[c.config_key] = c.value
+        return defaults
 
-        if not effective_weights:
-            return healthy[0]
+    def _calculate_score(self, gateway: GatewayName, weights: dict, amount: int, currency: str) -> float:
+        # A3.2 Formula
+        metrics = GatewayHealthMetrics.objects.filter(gateway=gateway.value).order_by('-recorded_at').first()
+        
+        success_score = metrics.success_rate if metrics else 0.95
+        latency_score = 1.0 - (min(metrics.p95_latency_ms, 2000) / 2000) if metrics else 0.8
+        
+        # Simple cost model: UPI is 0, Others are 0.02
+        cost_score = 1.0 if gateway == GatewayName.UPI else 0.5
+        
+        cb = CircuitBreaker.objects.filter(gateway=gateway.value).first()
+        health_score = 1.0
+        if cb:
+            if cb.state == CircuitBreaker.State.HALF_OPEN:
+                health_score = 0.5
+            elif cb.state == CircuitBreaker.State.OPEN:
+                health_score = 0.0
 
-        return random.choices(gateways, weights=effective_weights, k=1)[0]
-
-    def _round_robin_selection(self, healthy: List[GatewayName], rule_name: str) -> GatewayName:
-        cache_key = f"routing:rr:{rule_name}"
-        count = cache.incr(cache_key)
-        idx = count % len(healthy)
-        return healthy[idx]
-
-    def _priority_selection(self, healthy: List[GatewayName], weights: dict) -> GatewayName:
-        # Sort by priority field in weights
-        sorted_gateways = sorted(
-            healthy, 
-            key=lambda g: weights.get(g.value, {}).get('priority', 100)
+        fit_score = 1.0 # Assume all fit for now
+        
+        total_score = (
+            weights['success_rate_weight'] * success_score +
+            weights['latency_weight'] * latency_score +
+            weights['cost_weight'] * cost_score +
+            weights['health_weight'] * health_score +
+            weights['fit_weight'] * fit_score
         )
-        return sorted_gateways[0]
-
-    def _cost_optimized_selection(self, healthy: List[GatewayName], weights: dict) -> GatewayName:
-        # Filter to HEALTHY only for cost optimization if possible
-        # For now just pick cheapest from healthy/degraded
-        sorted_gateways = sorted(
-            healthy,
-            key=lambda g: weights.get(g.value, {}).get('cost_per_transaction', 999)
-        )
-        return sorted_gateways[0]
-
-    def _fallback_selection(self, exclude: List[GatewayName]) -> GatewayName:
-        registered_gateways = [gateway.name for gateway in gateway_registry.get_all()]
-        all_gateways = [g for g in registered_gateways if g not in exclude]
-        if not all_gateways:
-            raise NoAvailableGatewayError()
-        return random.choice(all_gateways)
+        
+        return total_score

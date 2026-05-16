@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { createPayment, updatePaymentStatus } from '../api/api';
 import { Send, AlertCircle, CheckCircle2, RefreshCcw, CreditCard } from 'lucide-react';
 
@@ -17,13 +18,15 @@ type PaymentResponse = {
   replayed?: boolean;
 };
 
+const generateUUID = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return Math.random().toString(36).substring(2) + Date.now().toString(36);
+};
+
 const PaymentSimulator: React.FC = () => {
-  const generateUUID = () => {
-    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-      return crypto.randomUUID();
-    }
-    return Math.random().toString(36).substring(2) + Date.now().toString(36);
-  };
+  const navigate = useNavigate();
 
   const [formData, setFormData] = useState({
     amount: '500',
@@ -51,7 +54,25 @@ const PaymentSimulator: React.FC = () => {
           preferred_gateway: formData.preferred_gateway
         }
       });
-      setResponse(res.data);
+      
+      const initialData = res.data;
+      setResponse(initialData);
+
+      // Automatically transition to AUTH_INITIATED if it starts at ROUTE_SELECTED
+      if (initialData.status === 'ROUTE_SELECTED' || initialData.status === 'CREATED') {
+        const paymentId = initialData.payment_id || initialData.id;
+        try {
+          const authRes = await updatePaymentStatus(paymentId, 'AUTH_INITIATED');
+          setResponse(prev => ({
+            ...prev,
+            ...authRes.data,
+            routing_history: (prev as any)?.routing_history
+          }));
+        } catch (authErr) {
+          console.error('Initial auto-transition failed:', authErr);
+        }
+      }
+
       // Reset UUID for next attempt
       setFormData(prev => ({ ...prev, idempotencyKey: generateUUID() }));
     } catch (err: any) {
@@ -85,16 +106,77 @@ const PaymentSimulator: React.FC = () => {
 
     setUpdating(true);
     try {
-      const res = await updatePaymentStatus(paymentId, newStatus);
-      // Ensure we preserve the routing_history if the update doesn't return it
-      setResponse(prev => ({
-        ...prev,
-        ...res.data,
-        routing_history: (prev as any)?.routing_history
-      }));
+      if (newStatus === 'CAPTURED') {
+        let currentStatus = response.status || '';
+        
+        // Sequential transitions to satisfy the strict backend state machine
+        const sequence = ['AUTHORISED', 'CAPTURE_INITIATED', 'CAPTURED'];
+        let lastRes = null;
+
+        for (const targetState of sequence) {
+          // Skip states we've already passed (though in simulator it usually starts at AUTH_INITIATED)
+          if (currentStatus === 'CAPTURED') break;
+          
+          try {
+            lastRes = await updatePaymentStatus(paymentId, targetState);
+            currentStatus = targetState;
+            setResponse(prev => ({
+              ...prev,
+              ...lastRes.data,
+              routing_history: (prev as any)?.routing_history
+            }));
+          } catch (err: any) {
+            console.error(`Transition to ${targetState} failed:`, err);
+            throw err;
+          }
+        }
+
+        if (currentStatus === 'CAPTURED') {
+          setTimeout(() => {
+            navigate(`/payment-success/${paymentId}`);
+          }, 1500);
+        }
+      } else {
+        // Handle FAILED, PROCESSING, or other status updates normally
+        const currentStatus = response.status || '';
+        const resolvedStatus = (() => {
+          if (newStatus === 'PROCESSING') {
+            if (currentStatus === 'ROUTE_SELECTED' || currentStatus === 'CREATED') return 'AUTH_INITIATED';
+            if (currentStatus === 'AUTH_INITIATED') return 'AUTHORISED';
+            if (currentStatus === 'AUTHORISED') return 'CAPTURE_INITIATED';
+            return currentStatus; // No more intermediate steps
+          }
+
+          if (newStatus !== 'FAILED') return newStatus;
+          
+          if (currentStatus === 'ROUTE_SELECTED' || currentStatus === 'CREATED') return 'ROUTE_FAILED';
+          if (currentStatus === 'AUTH_INITIATED') return 'AUTH_FAILED';
+          if (currentStatus === 'CAPTURE_INITIATED') return 'CAPTURE_FAILED';
+          return 'FAILED';
+        })();
+
+        if (resolvedStatus === currentStatus) {
+          setUpdating(false);
+          return;
+        }
+
+        const res = await updatePaymentStatus(paymentId, resolvedStatus);
+        setResponse(prev => ({
+          ...prev,
+          ...res.data,
+          routing_history: (prev as any)?.routing_history
+        }));
+
+        if (res.data.status.includes('FAILED')) {
+          setTimeout(() => {
+            navigate(`/payment-failed/${paymentId}`);
+          }, 1500);
+        }
+      }
     } catch (err: any) {
       console.error('Status update error:', err);
-      alert('Failed to update status: ' + (err.response?.data?.error || err.message));
+      const errorMessage = err.response?.data?.error?.message || err.response?.data?.error || err.message;
+      alert('Failed to update status: ' + errorMessage);
     } finally {
       setUpdating(false);
     }
@@ -126,7 +208,17 @@ const PaymentSimulator: React.FC = () => {
               <label className="block text-sm font-medium text-gray-400 mb-1">Currency</label>
               <select 
                 value={formData.currency}
-                onChange={(e) => setFormData({...formData, currency: e.target.value})}
+                onChange={(e) => {
+                  const newCurrency = e.target.value;
+                  setFormData(prev => {
+                    const nextData = {...prev, currency: newCurrency};
+                    // Reset preferred gateway if not supported by new currency
+                    if (newCurrency !== 'INR' && prev.preferred_gateway !== '' && prev.preferred_gateway !== 'STRIPE') {
+                      nextData.preferred_gateway = '';
+                    }
+                    return nextData;
+                  });
+                }}
                 className="w-full bg-gray-900 border border-gray-800 rounded-lg py-2 px-4 focus:outline-none focus:border-indigo-600"
               >
                 <option value="INR">INR</option>
@@ -153,10 +245,16 @@ const PaymentSimulator: React.FC = () => {
                 className="w-full bg-gray-900 border border-gray-800 rounded-lg py-2 px-4 focus:outline-none focus:border-indigo-600"
               >
                 <option value="">Auto-Route (Recommended)</option>
-                <option value="STRIPE">Stripe</option>
-                <option value="RAZORPAY">Razorpay</option>
-                <option value="PAYU">PayU</option>
-                <option value="UPI">UPI (Simulated)</option>
+                {formData.currency === 'INR' ? (
+                  <>
+                    <option value="RAZORPAY">Razorpay</option>
+                    <option value="PAYU">PayU</option>
+                    <option value="UPI">UPI (Simulated)</option>
+                    <option value="STRIPE">Stripe</option>
+                  </>
+                ) : (
+                  <option value="STRIPE">Stripe</option>
+                )}
               </select>
             </div>
             <button 
@@ -237,16 +335,16 @@ const PaymentSimulator: React.FC = () => {
             <div className={`transition-all duration-500 rounded-xl p-6 border ${
               response.status === 'CAPTURED' || response.status === 'SUCCESS'
                 ? 'bg-green-900/20 border-green-900/50 text-green-400'
-                : response.status === 'FAILED'
+                : response.status === 'FAILED' || response.status === 'ROUTE_FAILED'
                 ? 'bg-red-900/20 border-red-900/50 text-red-400'
                 : 'bg-yellow-900/20 border-yellow-900/50 text-yellow-400'
             }`}>
               <div className="flex items-center space-x-2 mb-4">
                 {response.status === 'CAPTURED' || response.status === 'SUCCESS' ? <CheckCircle2 size={20} /> :
-                 response.status === 'FAILED' ? <AlertCircle size={20} /> : <RefreshCcw size={20} className="animate-spin-slow" />}
+                 response.status === 'FAILED' || response.status === 'ROUTE_FAILED' ? <AlertCircle size={20} /> : <RefreshCcw size={20} className="animate-spin-slow" />}
                 <span className="font-semibold">
                   {response.status === 'CAPTURED' || response.status === 'SUCCESS' ? 'Payment Successful' :
-                   response.status === 'FAILED' ? 'Payment Failed' : 'Payment Processing'}
+                   response.status === 'FAILED' || response.status === 'ROUTE_FAILED' ? 'Payment Failed' : 'Payment Processing'}
                 </span>
               </div>
               <div className="space-y-3">

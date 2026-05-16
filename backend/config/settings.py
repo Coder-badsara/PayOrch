@@ -83,12 +83,18 @@ TEMPLATES = [
 WSGI_APPLICATION = 'config.wsgi.application'
 
 # Database
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+# Use DATABASE_URL if provided (e.g. postgresql://user:pass@host:port/dbname), otherwise use SQLite
+if env('DATABASE_URL', default=None):
+    DATABASES = {
+        'default': env.db(),
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
 
 # Redis Cache (with fallback to LocMemCache for pure local dev)
 REDIS_URL = env('REDIS_URL', default=None)
@@ -153,6 +159,7 @@ STRIPE_WEBHOOK_SECRET = env('STRIPE_WEBHOOK_SECRET', default='')
 PAYU_MERCHANT_KEY = env('PAYU_MERCHANT_KEY', default='')
 PAYU_MERCHANT_SALT = env('PAYU_MERCHANT_SALT', default='')
 PAYU_WEBHOOK_SECRET = env('PAYU_WEBHOOK_SECRET', default='')
+PAYU_ENVIRONMENT = env('PAYU_ENVIRONMENT', default='sandbox')
 
 UPI_VPA = env('UPI_VPA', default='')
 UPI_WEBHOOK_SECRET = env('UPI_WEBHOOK_SECRET', default='')

@@ -1,17 +1,13 @@
 import time
-import random
 import uuid
-import hmac
-import hashlib
 from typing import Any
-from django.conf import settings
 from apps.payments.models import GatewayName, TransactionStatus
 from .base import (
     BaseGateway, CreateOrderParams, CreateOrderResult, 
     CapturePaymentParams, RefundPaymentParams, GatewayPaymentStatus, 
     HealthCheckResult, NormalizedWebhookEvent
 )
-from apps.core.exceptions import GatewayError, GatewayTimeoutError
+from apps.core.exceptions import GatewayError
 
 class UPIGateway(BaseGateway):
     @property
@@ -19,79 +15,58 @@ class UPIGateway(BaseGateway):
         return GatewayName.UPI
 
     def create_order(self, params: CreateOrderParams) -> CreateOrderResult:
-        self._simulate_behavior()
-        
-        order_id = f"upi_order_{uuid.uuid4().hex[:12]}"
-        return CreateOrderResult(
-            gateway_order_id=order_id,
-            checkout_payload={
-                "vpa": settings.UPI_VPA,
-                "order_id": order_id,
-                "amount": params.amount,
-            },
-            raw_response={"status": "created", "id": order_id}
-        )
+        # Mock UPI intent generation
+        try:
+            upi_id = f"payorch.{uuid.uuid4().hex[:8]}@upi"
+            return CreateOrderResult(
+                gateway_order_id=str(uuid.uuid4()),
+                checkout_payload={
+                    "upi_id": upi_id,
+                    "qr_code": f"upi://pay?pa={upi_id}&am={params.amount / 100.0}&cu=INR",
+                },
+                raw_response={"status": "OPEN"}
+            )
+        except Exception as e:
+            raise GatewayError(self.name, str(e))
 
     def capture_payment(self, params: CapturePaymentParams) -> None:
-        self._simulate_behavior()
+        pass # UPI is usually instant capture
 
     def refund_payment(self, params: RefundPaymentParams) -> str:
-        self._simulate_behavior()
-        return f"upi_refund_{uuid.uuid4().hex[:12]}"
+        return f"upi_ref_{uuid.uuid4().hex}"
 
     def get_payment_status(self, gateway_payment_id: str) -> GatewayPaymentStatus:
-        self._simulate_behavior()
         return GatewayPaymentStatus(
-            gateway_status="captured",
+            gateway_status='SUCCESS',
             normalized_status=TransactionStatus.CAPTURED,
-            amount=1000, # Mock
-            currency="INR",
-            raw_response={"status": "captured"}
+            amount=0,
+            currency='INR',
+            raw_response={}
         )
 
     def health_check(self) -> HealthCheckResult:
-        start_time = time.time()
-        try:
-            self._simulate_behavior()
-            latency = int((time.time() - start_time) * 1000)
-            return HealthCheckResult(is_healthy=True, latency_ms=latency)
-        except Exception as e:
-            latency = int((time.time() - start_time) * 1000)
-            return HealthCheckResult(is_healthy=False, latency_ms=latency, error=str(e))
+        return HealthCheckResult(is_healthy=True, latency_ms=50)
 
     def verify_webhook_signature(self, raw_body: bytes, signature: str, secret: str) -> bool:
-        expected_signature = hmac.new(
-            secret.encode(),
-            raw_body,
-            hashlib.sha256
-        ).hexdigest()
-        return hmac.compare_digest(expected_signature, signature)
+        return True
 
     def normalize_webhook_event(self, raw_payload: Any) -> NormalizedWebhookEvent:
         return NormalizedWebhookEvent(
-            event_type=raw_payload.get('type'),
-            gateway_event_id=raw_payload.get('id'),
-            payment_id=raw_payload.get('payment_id'),
+            event_type='upi_callback',
+            gateway_event_id=raw_payload.get('txn_id'),
+            payment_id=None,
             gateway_order_id=raw_payload.get('order_id'),
-            gateway_payment_id=raw_payload.get('payment_id'),
+            gateway_payment_id=raw_payload.get('txn_id'),
             amount=raw_payload.get('amount'),
-            currency=raw_payload.get('currency'),
-            status=TransactionStatus.CAPTURED,
+            currency='INR',
+            status=self._map_status(raw_payload.get('status')),
             raw_payload=raw_payload
         )
 
-    def _simulate_behavior(self):
-        failure_rate = settings.UPI_SIMULATE_FAILURE_RATE
-        latency_ms = settings.UPI_SIMULATE_LATENCY_MS
-        timeout_threshold = settings.FAILOVER_TIMEOUT_MS
-
-        # Simulate latency
-        time.sleep(latency_ms / 1000.0)
-
-        # Simulate timeout
-        if latency_ms > timeout_threshold:
-            raise GatewayTimeoutError(self.name)
-
-        # Simulate failure
-        if random.random() < failure_rate:
-            raise GatewayError(self.name, "Simulated UPI Failure")
+    def _map_status(self, status: str) -> TransactionStatus:
+        mapping = {
+            'SUCCESS': TransactionStatus.CAPTURED,
+            'FAILURE': TransactionStatus.FAILED,
+            'PENDING': TransactionStatus.AUTH_INITIATED,
+        }
+        return mapping.get(status, TransactionStatus.AUTH_FAILED)

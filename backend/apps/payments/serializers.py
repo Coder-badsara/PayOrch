@@ -1,23 +1,29 @@
 from rest_framework import serializers
-from apps.payments.models import Payment, PaymentAttempt, StateTransition, GatewayName
+from .models import Transaction, GatewayRoute, TransactionStateLog
 
-class PaymentSerializer(serializers.ModelSerializer):
+class TransactionSerializer(serializers.ModelSerializer):
+    status = serializers.CharField(source='state')
+
     class Meta:
-        model = Payment
-        fields = '__all__'
+        model = Transaction
+        fields = [
+            'id', 'merchant_order_id', 'idempotency_key', 'amount', 
+            'currency', 'status', 'gateway_name', 'gateway_reference', 
+            'metadata', 'created_at', 'updated_at'
+        ]
 
-class CreatePaymentRequestSerializer(serializers.Serializer):
-    amount = serializers.IntegerField(min_value=100)
-    currency = serializers.ChoiceField(choices=['INR', 'USD', 'EUR'])
+class CreateTransactionRequestSerializer(serializers.Serializer):
     idempotencyKey = serializers.UUIDField()
+    amount = serializers.IntegerField(min_value=1)
+    currency = serializers.CharField(max_length=3, default='INR')
     metadata = serializers.JSONField(required=False)
 
-class PaymentAttemptSerializer(serializers.ModelSerializer):
+class GatewayRouteSerializer(serializers.ModelSerializer):
     class Meta:
-        model = PaymentAttempt
+        model = GatewayRoute
         fields = '__all__'
 
-class StateTransitionSerializer(serializers.ModelSerializer):
+class TransactionStateLogSerializer(serializers.ModelSerializer):
     class Meta:
-        model = StateTransition
+        model = TransactionStateLog
         fields = '__all__'

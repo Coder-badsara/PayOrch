@@ -2,15 +2,15 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
-from .models import Payment, PaymentAttempt, StateTransition, TransactionStatus, GatewayName
-from .serializers import PaymentSerializer, CreatePaymentRequestSerializer, PaymentAttemptSerializer, StateTransitionSerializer
+from .models import Transaction, GatewayRoute, TransactionStateLog, TransactionStatus, GatewayName
+from .serializers import TransactionSerializer, CreateTransactionRequestSerializer, GatewayRouteSerializer, TransactionStateLogSerializer
 from apps.orchestrator.service import OrchestratorService
 from apps.orchestrator.health_service import HealthService
 from apps.core.exceptions import AllGatewaysFailedError, InvalidStateTransitionError
+from .state_machine import TransactionStateMachine
 
 service = OrchestratorService()
 health_service = HealthService()
-
 
 from rest_framework.pagination import PageNumberPagination
 
@@ -19,12 +19,12 @@ class StandardResultsSetPagination(PageNumberPagination):
     page_size_query_param = 'page_size'
     max_page_size = 100
 
-class PaymentViewSet(viewsets.ViewSet):
-    queryset = Payment.objects.all().order_by('-created_at')
-    serializer_class = PaymentSerializer
+class TransactionViewSet(viewsets.ViewSet):
+    queryset = Transaction.objects.all().order_by('-created_at')
+    serializer_class = TransactionSerializer
 
     def list(self, request):
-        queryset = Payment.objects.all().order_by('-created_at')
+        queryset = Transaction.objects.all().order_by('-created_at')
         
         # Filtering by gateway
         gateway = request.query_params.get('gateway')
@@ -50,12 +50,12 @@ class PaymentViewSet(viewsets.ViewSet):
         return Response(serializer.data)
 
     def retrieve(self, request, pk=None):
-        payment = self._get_payment(pk)
-        serializer = self.serializer_class(payment)
+        txn = self._get_transaction(pk)
+        serializer = self.serializer_class(txn)
         return Response(serializer.data)
 
     def create(self, request):
-        serializer = CreatePaymentRequestSerializer(data=request.data)
+        serializer = CreateTransactionRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         try:
@@ -77,54 +77,59 @@ class PaymentViewSet(viewsets.ViewSet):
                 {"error": {"code": "INVALID_STATE", "message": str(e)}},
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
+        except Exception as e:
+            return Response(
+                {"error": {"code": "SYSTEM_ERROR", "message": str(e)}},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
     @action(detail=True, methods=['post'])
-    def update_status(self, request, pk=None):
-        payment = self._get_payment(pk)
-        new_status = request.data.get('status')
+    def update_state(self, request, pk=None):
+        txn = self._get_transaction(pk)
+        new_state = request.data.get('state')
         
-        if not new_status:
-            return Response({"error": "Status is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if not new_state:
+            return Response({"error": "State is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if new_state == 'PROCESSING':
+            serializer = self.serializer_class(txn)
+            return Response(serializer.data)
+
+        if new_state == TransactionStatus.FAILED:
+            state_aliases = {
+                TransactionStatus.ROUTE_SELECTED: TransactionStatus.ROUTE_FAILED,
+                TransactionStatus.AUTH_INITIATED: TransactionStatus.AUTH_FAILED,
+                TransactionStatus.CAPTURE_INITIATED: TransactionStatus.CAPTURE_FAILED,
+            }
+            new_state = state_aliases.get(txn.state, TransactionStatus.FAILED)
             
-        old_status = payment.status
         try:
-            # Update status directly for simulation purposes
-            payment.status = new_status
-            payment.save()
-            
-            # Record health if it's a terminal status and we have a gateway
-            if payment.gateway_name and new_status in [TransactionStatus.CAPTURED, TransactionStatus.FAILED]:
-                health_service.record_event(
-                    gateway_name=GatewayName(payment.gateway_name),
-                    success=(new_status == TransactionStatus.CAPTURED)
-                )
-            
-            # Record transition using valid choices
-            StateTransition.objects.create(
-                payment=payment,
-                from_status=old_status,
-                to_status=new_status,
-                trigger="SIMULATOR_ACTION"
+            fsm = TransactionStateMachine(txn)
+            fsm.transition_to(
+                to_state=new_state,
+                event="SIMULATOR_ACTION",
+                created_by=request.user.username if request.user.is_authenticated else "simulator"
             )
             
-            serializer = self.serializer_class(payment)
+            txn = fsm.transaction_obj
+            serializer = self.serializer_class(txn)
             return Response(serializer.data)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-    def _get_payment(self, pk):
-        return get_object_or_404(Payment, pk=pk)
+    def _get_transaction(self, pk):
+        return get_object_or_404(Transaction, pk=pk)
 
     @action(detail=True, methods=['get'])
     def attempts(self, request, pk=None):
-        payment = self._get_payment(pk)
-        attempts = payment.attempts.all()
-        serializer = PaymentAttemptSerializer(attempts, many=True)
+        txn = self._get_transaction(pk)
+        attempts = txn.attempts.all()
+        serializer = GatewayRouteSerializer(attempts, many=True)
         return Response(serializer.data)
 
     @action(detail=True, methods=['get'])
     def history(self, request, pk=None):
-        payment = self._get_payment(pk)
-        history = payment.state_history.all()
-        serializer = StateTransitionSerializer(history, many=True)
+        txn = self._get_transaction(pk)
+        history = txn.state_history.all()
+        serializer = TransactionStateLogSerializer(history, many=True)
         return Response(serializer.data)

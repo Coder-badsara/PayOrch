@@ -1,0 +1,125 @@
+PAYMENT ORCHESTRATION SYSTEM - QUICK REFERENCE
+═════════════════════════════════════════════════════════════════
+
+🚀 STARTUP (Pick One)
+
+Option 1 (Easiest - Windows):
+→ Double-click: start-servers.bat
+
+Option 2 (Manual - Backend):
+→ cd backend
+→ python manage.py runserver
+
+Option 3 (Manual - Frontend):
+→ cd frontend
+→ npm run dev
+
+═════════════════════════════════════════════════════════════════
+
+🌐 ACCESS URLs
+
+Backend API:        http://localhost:8000/api/v1/
+Backend Health:     http://localhost:8000/api/v1/health/
+Backend Admin:      http://localhost:8000/admin/
+Frontend:           http://localhost:5173/  (or 5174)
+
+═════════════════════════════════════════════════════════════════
+
+⚙️ SETUP (One-Time)
+
+Backend:
+1. pip install -r backend/requirements.txt
+2. python manage.py migrate
+3. python manage.py check
+
+Frontend:
+1. npm install --legacy-peer-deps
+2. Check frontend/.env.local exists
+
+═════════════════════════════════════════════════════════════════
+
+📝 KEY COMMANDS
+
+# Check system
+python manage.py check
+
+# Run migrations
+python manage.py migrate
+
+# Create admin user
+python manage.py createsuperuser
+
+# Run tests
+python manage.py test
+
+# Run reconciliation
+python manage.py run_reconciliation
+
+# Backend lint/format
+python -m pylint apps/
+python -m black apps/
+
+# Frontend lint
+npm run lint
+
+═════════════════════════════════════════════════════════════════
+
+🔧 CONFIGURATION FILES
+
+Backend: backend/.env
+Frontend: frontend/.env.local
+Settings: backend/config/settings.py
+
+═════════════════════════════════════════════════════════════════
+
+🆘 QUICK FIXES
+
+Port 8000 in use?
+→ python manage.py runserver 0.0.0.0:8001
+
+Port 5173 in use?
+→ Vite auto-increments (tries 5174, 5175, etc.)
+
+Missing dependencies?
+→ pip install -r backend/requirements.txt
+→ npm install --legacy-peer-deps
+
+API not working?
+→ Check: http://localhost:8000/api/v1/health/
+
+═════════════════════════════════════════════════════════════════
+
+📊 DASHBOARD FEATURES
+
+• Transactions List
+• Gateway Health Status
+• Payment Simulator
+• Webhook Logs
+• State History & Audit Trail
+• Routing Attempts
+
+═════════════════════════════════════════════════════════════════
+
+🔐 SECURITY (DEV ONLY)
+
+Backend .env has:
+- DEBUG=True (disable in production)
+- FORCE_GATEWAY_SUCCESS=True (for testing)
+- Hardcoded API keys (use secrets manager in prod)
+
+═════════════════════════════════════════════════════════════════
+
+📚 FULL DOCUMENTATION
+
+See: SETUP.md (comprehensive)
+See: README_SETUP.txt (this checklist)
+See: backend/plans/orchestration_implementation_plan.md
+
+═════════════════════════════════════════════════════════════════
+
+✅ STATUS: READY TO RUN
+
+Everything is configured and tested.
+Run start-servers.bat to begin!
+
+═════════════════════════════════════════════════════════════════

@@ -1,10 +1,12 @@
 import hashlib
+import json
 from django.conf import settings
-from django_redis import get_redis_connection
-from apps.payments.models import GatewayName, Payment
-from apps.payments.state_machine import PaymentStateMachine
+from django.db import transaction, models
+from django.utils import timezone
+from apps.payments.models import GatewayName, Transaction, TransactionStatus
+from apps.payments.state_machine import TransactionStateMachine
 from apps.gateways.registry import gateway_registry
-from .models import WebhookEvent, WebhookEventStatus
+from .models import ProcessedWebhookEvent, WebhookQueue
 from apps.core.exceptions import WebhookSignatureError
 from apps.orchestrator.health_service import HealthService
 from celery import shared_task
@@ -13,119 +15,108 @@ import logging
 logger = logging.getLogger(__name__)
 health_service = HealthService()
 
-class DeduplicationService:
-    def is_duplicate(self, deduplication_key: str) -> bool:
-        # Layer 1: Redis
-        redis_conn = get_redis_connection("default")
-        redis_key = f"webhook:dedup:{deduplication_key}"
-        if redis_conn.get(redis_key):
-            return True
-        
-        # Layer 2: DB
-        if WebhookEvent.objects.filter(deduplication_key=deduplication_key).exists():
-            # Backfill Redis
-            redis_conn.set(redis_key, "1", ex=86400)
-            return True
-            
-        return False
-
-    def mark_seen(self, deduplication_key: str):
-        redis_conn = get_redis_connection("default")
-        redis_key = f"webhook:dedup:{deduplication_key}"
-        redis_conn.set(redis_key, "1", ex=86400)
-
 class WebhookService:
-    def __init__(self):
-        self.dedup_service = DeduplicationService()
-
-    def ingest_webhook(self, gateway_name: GatewayName, raw_body: bytes, signature: str):
-        # 1. Compute deduplication key
-        dedup_key = hashlib.sha256(f"{gateway_name.value}:{raw_body.hex()}".encode()).hexdigest()
+    def ingest_webhook(self, gateway_name: str, raw_body: bytes, signature: str):
+        # 1. Verify signature (A5.3)
+        gateway_adapter = gateway_registry.get(GatewayName(gateway_name))
+        secret = getattr(settings, f'{gateway_name}_WEBHOOK_SECRET', '')
         
-        # 2. Check for duplicates
-        if self.dedup_service.is_duplicate(dedup_key):
-            logger.info(f"Duplicate webhook detected: {dedup_key}")
-            return {"status": "DUPLICATE", "dedup_key": dedup_key}
+        if not gateway_adapter.verify_webhook_signature(raw_body, signature, secret):
+            raise WebhookSignatureError(gateway_name)
 
-        # 3. Verify signature
-        gateway = gateway_registry.get(gateway_name)
-        # In a real app, secrets would be per-gateway and stored in DB or Env
-        secret = getattr(settings, f'{gateway_name.value}_WEBHOOK_SECRET', '')
-        
-        if not gateway.verify_webhook_signature(raw_body, signature, secret):
-            raise WebhookSignatureError(gateway_name.value)
-
-        # 4. Normalize and Save
-        import json
         payload = json.loads(raw_body.decode('utf-8'))
-        normalized = gateway.normalize_webhook_event(payload)
-        
-        event = WebhookEvent.objects.create(
-            gateway_name=gateway_name,
-            event_type=normalized.event_type,
-            gateway_event_id=normalized.gateway_event_id,
-            raw_payload=payload,
-            normalized_payload=normalized.__dict__,
-            status=WebhookEventStatus.RECEIVED,
-            signature_valid=True,
-            deduplication_key=dedup_key
-        )
-        
-        self.dedup_service.mark_seen(dedup_key)
-        
-        # 5. Process Async
-        process_webhook_event.delay(str(event.id))
-        
-        return {"status": "ACCEPTED", "event_id": str(event.id)}
+        normalized = gateway_adapter.normalize_webhook_event(payload)
+        event_id = normalized.gateway_event_id or hashlib.md5(raw_body).hexdigest()
 
-@shared_task
-def process_webhook_event(event_id: str):
+        # 2. Atomic Deduplication (A5.4)
+        with transaction.atomic():
+            if ProcessedWebhookEvent.objects.filter(gateway=gateway_name, event_id=event_id).exists():
+                logger.info(f"Duplicate webhook detected: {gateway_name}:{event_id}")
+                return {"status": "ALREADY_PROCESSED", "event_id": event_id}
+
+            # Enqueue for async processing (DLQ pattern A8.3)
+            queue_item = WebhookQueue.objects.create(
+                gateway=gateway_name,
+                event_id=event_id,
+                payload=payload,
+                signature=signature,
+                status=WebhookQueue.Status.PENDING
+            )
+
+        # 3. Trigger Async Processing
+        process_webhook_queue_item.delay(queue_item.id)
+        
+        return {"status": "ACCEPTED", "event_id": event_id}
+
+@shared_task(bind=True, max_retries=3)
+def process_webhook_queue_item(self, item_id: int):
     try:
-        event = WebhookEvent.objects.get(id=event_id)
-        event.status = WebhookEventStatus.PROCESSING
-        event.save()
-        
-        normalized = event.normalized_payload
-        gateway_order_id = normalized.get('gateway_order_id')
-        
-        # Find payment
-        payment = Payment.objects.filter(
-            models.Q(gateway_order_id=gateway_order_id) | 
-            models.Q(id=normalized.get('payment_id'))
-        ).first()
-        
-        if not payment:
-            logger.error(f"Payment not found for webhook {event_id}")
-            event.status = WebhookEventStatus.FAILED
-            event.processing_error = "Payment not found"
-            event.save()
-            return
+        item = WebhookQueue.objects.get(id=item_id)
+        item.status = WebhookQueue.Status.PROCESSING
+        item.save()
 
-        event.payment = payment
+        gateway_adapter = gateway_registry.get(GatewayName(item.gateway))
+        normalized = gateway_adapter.normalize_webhook_event(item.payload)
         
-        # Transition FSM
-        fsm = PaymentStateMachine(payment)
-        fsm.transition_to(
-            to_status=normalized.get('status'),
-            trigger=f"WEBHOOK_{normalized.get('event_type')}",
-            metadata=normalized
-        )
+        payload_hash = hashlib.sha256(json.dumps(item.payload).encode()).hexdigest()
+
+        # Find transaction
+        txn = Transaction.objects.filter(
+            models.Q(gateway_reference=normalized.gateway_order_id) | 
+            models.Q(id=normalized.payment_id) # payment_id maps to txn.id in normalization
+        ).first()
+
+        if not txn:
+            logger.error(f"Transaction not found for webhook {item.event_id}")
+            raise Exception("Transaction not found")
+
+        # Atomic state transition + deduplication record
+        with transaction.atomic():
+            # Check if already processed (secondary check)
+            if ProcessedWebhookEvent.objects.filter(gateway=item.gateway, event_id=item.event_id).exists():
+                item.status = WebhookQueue.Status.COMPLETED
+                item.save()
+                return
+
+            # Transition FSM
+            fsm = TransactionStateMachine(txn)
+            fsm.transition_to(
+                to_state=normalized.status,
+                event=f"WEBHOOK_{normalized.event_type}",
+                gateway_response=item.payload,
+                created_by="webhook_processor"
+            )
+
+            # Record deduplication
+            ProcessedWebhookEvent.objects.create(
+                gateway=item.gateway,
+                event_id=item.event_id,
+                event_type=normalized.event_type,
+                payload_hash=payload_hash,
+                transaction=txn
+            )
+
+            item.status = WebhookQueue.Status.COMPLETED
+            item.processed_at = timezone.now()
+            item.save()
 
         # Record health stats
-        new_status = normalized.get('status')
-        if new_status in [TransactionStatus.CAPTURED, TransactionStatus.FAILED]:
+        if normalized.status in [TransactionStatus.CAPTURED, TransactionStatus.FAILED]:
             health_service.record_event(
-                gateway_name=GatewayName(event.gateway_name),
-                success=(new_status == TransactionStatus.CAPTURED)
+                gateway_name=GatewayName(item.gateway),
+                success=(normalized.status == TransactionStatus.CAPTURED)
             )
-        
-        event.status = WebhookEventStatus.PROCESSED
-        event.processed_at = timezone.now()
-        event.save()
-        
+            
     except Exception as e:
-        logger.error(f"Error processing webhook {event_id}: {str(e)}")
-        event.status = WebhookEventStatus.FAILED
-        event.processing_error = str(e)
-        event.save()
-        raise
+        logger.error(f"Error processing webhook item {item_id}: {str(e)}")
+        item = WebhookQueue.objects.get(id=item_id)
+        item.error_message = str(e)
+        
+        if self.request.retries < self.max_retries:
+            item.status = WebhookQueue.Status.FAILED
+            item.next_retry_at = timezone.now() + timezone.timedelta(minutes=2**self.request.retries)
+            item.save()
+            raise self.retry(exc=e, countdown=60 * (2**self.request.retries))
+        else:
+            item.status = WebhookQueue.Status.DLQ
+            item.save()
